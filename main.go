@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -79,12 +80,13 @@ func synthesize(
 // because telegram has an URL length limit
 // for inline query responses
 var md5Cache map[string]*cacheEntry = make(map[string]*cacheEntry)
+var md5CacheMux sync.Mutex = sync.Mutex{}
 
 // pollyClient is the AWS polly client
 var pollyClient *polly.Polly
 
 // conf is the environment config
-var conf *config
+var conf config
 
 func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 	b64Text := r.URL.Query().Get("text")
@@ -106,7 +108,9 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("Invalid request"))
 			return
 		}
+		md5CacheMux.Lock()
 		cache, ok := md5Cache[telegramMd5]
+		md5CacheMux.Unlock()
 		if !ok {
 			w.Write([]byte("Unknown md5"))
 			return
@@ -170,7 +174,6 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	var conf config
 	err := envconfig.Process("pepega", &conf)
 	if err != nil {
 		log.Fatal(err.Error())
@@ -202,10 +205,14 @@ func main() {
 	b.Handle(tb.OnQuery, func(q *tb.Query) {
 		uniText := strings.Trim(strings.ToLower(q.Text), " ")
 		uniTextMd5 := stringMd5(uniText)
-		_, ok := md5Cache[uniTextMd5]
-		if !ok {
-			md5Cache[uniTextMd5] = newCachedEntry(q.Text, time.Minute)
-		}
+		func() {
+			md5CacheMux.Lock()
+			defer md5CacheMux.Unlock()
+			_, ok := md5Cache[uniTextMd5]
+			if !ok {
+				md5Cache[uniTextMd5] = newCachedEntry(q.Text, time.Minute)
+			}
+		}()
 		if len(uniText) >= conf.MaxLength {
 			if b.Answer(q, &tb.QueryResponse{Results: tb.Results{}}) != nil {
 				log.Println(err.Error())
@@ -246,11 +253,15 @@ func main() {
 		for {
 			time.Sleep(10 * time.Minute)
 			log.Println("Clearning md5 cache")
-			for k, v := range md5Cache {
-				if v.expired() {
-					delete(md5Cache, k)
+			func() {
+				md5CacheMux.Lock()
+				defer md5CacheMux.Unlock()
+				for k, v := range md5Cache {
+					if v.expired() {
+						delete(md5Cache, k)
+					}
 				}
-			}
+			}()
 		}
 	}()
 	log.Println("Bot listening")
