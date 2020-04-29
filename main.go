@@ -23,6 +23,24 @@ import (
 
 var pollyClient *polly.Polly
 
+type cachedEntry struct {
+	content  string
+	issuedAt time.Time
+}
+
+func newCachedEntry(s string) *cachedEntry {
+	return &cachedEntry{
+		issuedAt: time.Now(),
+		content:  s,
+	}
+}
+
+func (c *cachedEntry) expired() bool {
+	return c.issuedAt.Before(time.Now().Add(-1 * time.Minute))
+}
+
+var md5Cache map[string]*cachedEntry = make(map[string]*cachedEntry)
+
 func stringMd5(s string) string {
 	return fmt.Sprintf("%x", md5.Sum([]byte(s)))
 }
@@ -41,16 +59,31 @@ func synthesize(p *polly.Polly, s string) (io.Reader, error) {
 
 func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 	b64Text := r.URL.Query().Get("text")
-	if b64Text == "" {
-		w.Write([]byte("Invalid query parameter"))
-		return
+
+	var text string
+	if b64Text != "" {
+		// base64
+		decoded, err := base64.StdEncoding.DecodeString(b64Text)
+		if err != nil {
+			w.Write([]byte("Base64 decode error"))
+			return
+		}
+		text = string(decoded)
+	} else {
+		// telegram md5
+		telegramMd5 := r.URL.Query().Get("telegram")
+		if telegramMd5 == "" {
+			w.Write([]byte("Invalid request"))
+			return
+		}
+		cache, ok := md5Cache[telegramMd5]
+		if !ok {
+			w.Write([]byte("Unknown md5"))
+			return
+		}
+		text = cache.content
 	}
-	b64, err := base64.StdEncoding.DecodeString(b64Text)
-	if err != nil {
-		w.Write([]byte("Base64 decode error"))
-		return
-	}
-	text := string(b64)
+
 	cacheFilePath := path.Join("audios", stringMd5(text)+".mp3")
 	if _, err := os.Stat(cacheFilePath); err != nil {
 		log.Printf("%s (AWS)\n", text)
@@ -110,17 +143,21 @@ func main() {
 	b.Handle(tb.OnQuery, func(q *tb.Query) {
 		uniText := strings.Trim(strings.ToLower(q.Text), " ")
 		uniTextMd5 := stringMd5(uniText)
-
+		_, ok := md5Cache[uniTextMd5]
+		if !ok {
+			md5Cache[uniTextMd5] = newCachedEntry(q.Text)
+		}
 		err := b.Answer(q, &tb.QueryResponse{
 			Results: tb.Results{
 				&tb.AudioResult{
 					ResultBase: tb.ResultBase{
 						ID: uniTextMd5,
 					},
-					Title: q.Text,
+					Caption: q.Text,
+					Title:   "🐸",
 					URL: fmt.Sprintf(
-						"https://pepega.nyodev.xyz/audio?text=%s",
-						base64.StdEncoding.EncodeToString([]byte(uniText)),
+						"https://pepega.nyodev.xyz/audio?telegram=%s",
+						uniTextMd5,
 					),
 				},
 			},
@@ -134,6 +171,17 @@ func main() {
 		http.HandleFunc("/audio", serveAudioHandler)
 		log.Println("Server started")
 		http.ListenAndServe(":7777", nil)
+	}()
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			log.Println("Clearning md5 cache")
+			for k, v := range md5Cache {
+				if v.expired() {
+					delete(md5Cache, k)
+				}
+			}
+		}
 	}()
 	log.Println("Bot listening")
 	b.Start()
