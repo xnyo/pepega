@@ -1,5 +1,5 @@
 # pepega
-### Telegram Inline Bot that's like Streamlab's TTS
+### Telegram Inline Bot that's like Streamlabs' TTS
 This bot uses AWS Polly to play messages via inline queries. That's it.
 
 ## Requirements
