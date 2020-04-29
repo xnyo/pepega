@@ -13,7 +13,7 @@ This bot uses AWS Polly to play messages via inline queries. That's it.
 $ git clone ...
 $ cd pepega
 $ docker build -t pepega .
-$ cat "[pepega]
+$ echo "[pepega]
 aws_access_key_id = YOUR_CREDENTIALS
 aws_secret_access_key = YOUR_CREDENTIALS" > .aws
 $ docker run \
