@@ -16,46 +16,75 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/polly"
+	"github.com/kelseyhightower/envconfig"
 	tb "gopkg.in/tucnak/telebot.v2"
 
 	"fmt"
 )
 
-var pollyClient *polly.Polly
+// config is the configuration struct
+type config struct {
+	PublicURL string `required:"true" split_words:"true"`
+	BotToken  string `required:"true" split_words:"true"`
 
-type cachedEntry struct {
-	content  string
-	issuedAt time.Time
+	MaxLength      int    `required:"true" default:"64" split_words:"true"`
+	AwsEndpoint    string `required:"true" default:"eu-central-1" split_words:"true"`
+	AwsFilePath    string `required:"true" default:".aws" split_words:"true"`
+	AwsProfile     string `required:"true" default:"pepega" split_words:"true"`
+	ListenTo       string `required:"true" default:":7777" split_words:"true"`
+	AudioCachePath string `required:"true" default:"audios" split_words:"true"`
 }
 
-func newCachedEntry(s string) *cachedEntry {
-	return &cachedEntry{
+type cacheEntry struct {
+	content  string
+	issuedAt time.Time
+	ttl      time.Duration
+}
+
+// newCachedEntry created a new cachedEntry
+func newCachedEntry(s string, ttl time.Duration) *cacheEntry {
+	return &cacheEntry{
 		issuedAt: time.Now(),
 		content:  s,
+		ttl:      time.Minute,
 	}
 }
 
-func (c *cachedEntry) expired() bool {
-	return c.issuedAt.Before(time.Now().Add(-1 * time.Minute))
+// expired returns true if the current cacheEntry is expired
+func (c *cacheEntry) expired() bool {
+	return c.issuedAt.Before(time.Now().Add(c.ttl))
 }
 
-var md5Cache map[string]*cachedEntry = make(map[string]*cachedEntry)
-
+// stringMd5 returns the md5 of a string
 func stringMd5(s string) string {
 	return fmt.Sprintf("%x", md5.Sum([]byte(s)))
 }
 
-func synthesize(p *polly.Polly, s string) (io.Reader, error) {
+// synthesize uses the provided aws polly client to synthesize a message
+func synthesize(
+	p *polly.Polly, s string, format string, voiceId string,
+) (io.Reader, error) {
 	output, err := p.SynthesizeSpeech(&polly.SynthesizeSpeechInput{
-		OutputFormat: aws.String("mp3"),
+		OutputFormat: aws.String(format),
 		Text:         aws.String(s),
-		VoiceId:      aws.String("Brian"),
+		VoiceId:      aws.String(voiceId),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("SynthesizeSpeech: %s", err)
+		return nil, fmt.Errorf("aws polly error: %s", err)
 	}
 	return output.AudioStream, nil
 }
+
+// md5Cache is an md5 -> plain text map,
+// because telegram has an URL length limit
+// for inline query responses
+var md5Cache map[string]*cacheEntry = make(map[string]*cacheEntry)
+
+// pollyClient is the AWS polly client
+var pollyClient *polly.Polly
+
+// conf is the environment config
+var conf *config
 
 func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 	b64Text := r.URL.Query().Get("text")
@@ -73,6 +102,7 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 		// telegram md5
 		telegramMd5 := r.URL.Query().Get("telegram")
 		if telegramMd5 == "" {
+			// ????
 			w.Write([]byte("Invalid request"))
 			return
 		}
@@ -84,11 +114,29 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 		text = cache.content
 	}
 
-	cacheFilePath := path.Join("audios", stringMd5(text)+".mp3")
+	// Check length
+	if len(text) > conf.MaxLength {
+		w.Write([]byte("Too long"))
+		return
+	}
+
+	// Create cache dir if it doesn't exist
+	if _, err := os.Stat(conf.AudioCachePath); os.IsNotExist(err) {
+		if os.Mkdir(conf.AudioCachePath, os.ModeDir) != nil {
+			w.Write([]byte("Could not create cache directory"))
+			return
+		}
+	}
+
+	// Try to get the file
+	cacheFilePath := path.Join(conf.AudioCachePath, stringMd5(text)+".mp3")
 	if _, err := os.Stat(cacheFilePath); err != nil {
+		// LET'S FUCKING GO BOOOOOOOOOOOOOYSSSSSSS
+		// The file is not in the cache. Get it from AWS.
 		log.Printf("%s (AWS)\n", text)
-		// Get from AWS
-		audioReader, err := synthesize(pollyClient, text)
+
+		// AWS polly
+		audioReader, err := synthesize(pollyClient, text, "mp3", "Brian")
 		if err != nil {
 			w.Write([]byte("Synthesize error"))
 			return
@@ -100,10 +148,14 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		defer f.Close()
 
+		// Send the response immediately
+		// TeeReader allows us to reuse the stream twice
 		var buf bytes.Buffer
 		tee := io.TeeReader(audioReader, &buf)
-		io.Copy(f, tee)
-		io.Copy(w, &buf)
+		io.Copy(w, tee)
+
+		// Start a goroutine that saves the file on disk
+		go io.Copy(f, &buf)
 		return
 	}
 
@@ -118,25 +170,32 @@ func serveAudioHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Printf("Usage: %s telegram_bot_token", os.Args[0])
-		os.Exit(1)
+	var conf config
+	err := envconfig.Process("pepega", &conf)
+	if err != nil {
+		log.Fatal(err.Error())
 	}
 
 	// Telegram bot
 	b, err := tb.NewBot(tb.Settings{
-		Token:  os.Args[1],
+		Token:  conf.BotToken,
 		Poller: &tb.LongPoller{Timeout: 10 * time.Second},
 	})
 	if err != nil {
-		panic(err)
+		log.Fatal(err.Error())
 	}
 
 	// Connect to AWS
-	sess := session.Must(session.NewSession(&aws.Config{
-		Region:      aws.String("eu-central-1"),
-		Credentials: credentials.NewSharedCredentials(".aws", "pepega"),
-	}))
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(conf.AwsEndpoint),
+		Credentials: credentials.NewSharedCredentials(
+			conf.AwsFilePath,
+			conf.AwsProfile,
+		),
+	})
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 	pollyClient = polly.New(sess)
 
 	// Register bot handlers
@@ -145,7 +204,13 @@ func main() {
 		uniTextMd5 := stringMd5(uniText)
 		_, ok := md5Cache[uniTextMd5]
 		if !ok {
-			md5Cache[uniTextMd5] = newCachedEntry(q.Text)
+			md5Cache[uniTextMd5] = newCachedEntry(q.Text, time.Minute)
+		}
+		if len(uniText) >= conf.MaxLength {
+			if b.Answer(q, &tb.QueryResponse{Results: tb.Results{}}) != nil {
+				log.Println(err.Error())
+			}
+			return
 		}
 		err := b.Answer(q, &tb.QueryResponse{
 			Results: tb.Results{
@@ -156,7 +221,8 @@ func main() {
 					Caption: q.Text,
 					Title:   "🐸",
 					URL: fmt.Sprintf(
-						"https://pepega.nyodev.xyz/audio?telegram=%s",
+						"%s/audio?telegram=%s",
+						conf.PublicURL,
 						uniTextMd5,
 					),
 				},
@@ -167,11 +233,15 @@ func main() {
 			log.Println(err.Error())
 		}
 	})
+
+	// HTTP server for telegram inline query URLs
 	go func() {
 		http.HandleFunc("/audio", serveAudioHandler)
 		log.Println("Server started")
-		http.ListenAndServe(":7777", nil)
+		http.ListenAndServe(conf.ListenTo, nil)
 	}()
+
+	// Clear cache URLs
 	go func() {
 		for {
 			time.Sleep(10 * time.Minute)
