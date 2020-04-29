@@ -1,4 +1,4 @@
-module pepegaclap
+module pepega
 
 go 1.12
 
